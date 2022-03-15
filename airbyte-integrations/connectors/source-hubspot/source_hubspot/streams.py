@@ -359,7 +359,38 @@ class Stream(HttpStream, ABC):
             yield from []
 
     @staticmethod
-    def _cast_value(declared_field_types: List, field_name: str, field_value: Any, declared_format: str = None) -> Any:
+    def _convert_datetime_to_string(dt: pendulum.datetime, declared_format: str = None) -> str:
+        if declared_format == "date":
+            return dt.to_date_string()
+        elif declared_format == "date-time":
+            return dt.to_datetime_string()
+
+    @classmethod
+    def _cast_datetime(cls, field_name: str, field_value: Any, declared_format: str = None) -> Any:
+        """
+        If format is date/date-time, but actual value is timestamp, convert timestamp to date/date-time string.
+        """
+        if not field_value:
+            return field_value
+
+        try:
+            dt = pendulum.parse(field_value)
+            return cls._convert_datetime_to_string(dt, declared_format=declared_format)
+        except (ValueError, TypeError) as ex:
+            logger.warning(
+                f"Couldn't parse date/datetime string in {field_name}, trying to parse timestamp... Field value: {field_value}. Ex: {ex}"
+            )
+
+        try:
+            dt = pendulum.from_timestamp(int(field_value) / 1000)
+            return cls._convert_datetime_to_string(dt, declared_format=declared_format)
+        except (ValueError, TypeError) as ex:
+            logger.warning(f"Couldn't parse timestamp in {field_name}. Field value: {field_value}. Ex: {ex}")
+
+        return field_value
+
+    @classmethod
+    def _cast_value(cls, declared_field_types: List, field_name: str, field_value: Any, declared_format: str = None) -> Any:
         """
         Convert record's received value according to its declared catalog json schema type / format / attribute name.
         :param declared_field_types type from catalog schema
@@ -376,6 +407,9 @@ class Stream(HttpStream, ABC):
             # Set it to null to avoid errors on destination' normalization stage.
             if declared_format and field_value == "":
                 return None
+
+        if declared_format in ["date", "date-time"]:
+            field_value = cls._cast_datetime(field_name, field_value, declared_format=declared_format)
 
         actual_field_type = type(field_value)
         actual_field_type_name = CUSTOM_FIELD_TYPE_TO_VALUE.get(actual_field_type)
@@ -729,6 +763,7 @@ class CRMSearchStream(IncrementalStream, ABC):
         payload = (
             {
                 "filters": [{"value": int(self._state.timestamp() * 1000), "propertyName": self.last_modified_field, "operator": "GTE"}],
+                "sorts": [{"propertyName": self.last_modified_field, "direction": "ASCENDING"}],
                 "properties": properties_list,
                 "limit": 100,
             }
@@ -788,6 +823,13 @@ class CRMSearchStream(IncrementalStream, ABC):
                 next_page_token = self.next_page_token(raw_response)
                 if not next_page_token:
                     pagination_complete = True
+                elif self.state and next_page_token["payload"]["after"] >= 10000:
+                    # Hubspot documentations states that the search endpoints are limited to 10,000 total results
+                    # for any given query. Attempting to page beyond 10,000 will result in a 400 error.
+                    # https://developers.hubspot.com/docs/api/crm/search. We stop getting data at 10,000 and
+                    # start a new search query with the latest state that has been collected.
+                    self._update_state(latest_cursor=latest_cursor)
+                    next_page_token = None
 
             self._update_state(latest_cursor=latest_cursor)
             # Always return an empty generator just in case no records were ever yielded
@@ -814,6 +856,11 @@ class CRMSearchStream(IncrementalStream, ABC):
             payload["after"] = int(response["paging"]["next"]["after"])
 
             return {"params": params, "payload": payload}
+
+    def stream_slices(
+        self, *, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
+    ) -> Iterable[Optional[Mapping[str, Any]]]:
+        return [None]
 
 
 class CRMObjectStream(Stream):
@@ -962,61 +1009,12 @@ class ContactsListMemberships(Stream):
         return params
 
 
-class DealStageHistoryStream(Stream):
-    """Deal stage history, API v1
-    Deal stage history is exposed by the v1 API, but not the v3 API.
-    The v1 endpoint requires the contacts scope.
-    Docs: https://legacydocs.hubspot.com/docs/methods/deals/get-all-deals
-    """
-
-    url = "/deals/v1/deal/paged"
-    more_key = "hasMore"
-    data_field = "deals"
-    updated_at_field = "timestamp"
-
-    def _transform(self, records: Iterable) -> Iterable:
-        for record in super()._transform(records):
-            dealstage = record.get("properties", {}).get("dealstage", {})
-            updated_at = dealstage.get(self.updated_at_field)
-            if updated_at:
-                yield {"id": record.get("dealId"), "dealstage": dealstage, self.updated_at_field: updated_at}
-
-    def request_params(
-        self,
-        stream_state: Mapping[str, Any],
-        stream_slice: Mapping[str, Any] = None,
-        next_page_token: Mapping[str, Any] = None,
-    ) -> MutableMapping[str, Any]:
-        return {"propertiesWithHistory": "dealstage"}
-
-
 class Deals(CRMSearchStream):
     """Deals, API v3"""
 
     entity = "deal"
     last_modified_field = "hs_lastmodifieddate"
-    associations = ["contacts"]
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._stage_history = DealStageHistoryStream(**kwargs)
-
-    def read_records(
-        self,
-        sync_mode: SyncMode,
-        cursor_field: List[str] = None,
-        stream_slice: Mapping[str, Any] = None,
-        stream_state: Mapping[str, Any] = None,
-    ) -> Iterable[Mapping[str, Any]]:
-        history_by_id = {}
-        for record in self._stage_history.read_records(sync_mode):
-            if all(field in record for field in ("id", "dealstage")):
-                history_by_id[record["id"]] = record["dealstage"]
-
-        for record in super().read_records(sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=stream_state):
-            if record.get("id") and int(record["id"]) in history_by_id:
-                record["dealstage"] = history_by_id[int(record["id"])]
-            yield record
+    associations = ["contacts", "companies"]
 
 
 class DealPipelines(Stream):
@@ -1254,7 +1252,7 @@ class Companies(CRMSearchStream):
 class Contacts(CRMSearchStream):
     entity = "contact"
     last_modified_field = "lastmodifieddate"
-    associations = ["contacts"]
+    associations = ["contacts", "companies"]
 
 
 class EngagementsCalls(CRMSearchStream):
@@ -1302,7 +1300,7 @@ class Products(CRMObjectIncrementalStream):
 
 class Tickets(CRMObjectIncrementalStream):
     entity = "ticket"
-    associations = ["contacts", "deals"]
+    associations = ["contacts", "deals", "companies"]
 
 
 class Quotes(CRMObjectIncrementalStream):
